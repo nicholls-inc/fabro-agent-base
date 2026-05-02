@@ -42,16 +42,23 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build test image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: tests/Dockerfile.test
-          build-args: |
-            BASE_IMAGE=fabro-agent-base:test
-          tags: fabro-agent-base:test-runner
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        # Plain `docker build` (not docker/build-push-action) is intentional.
+        # The previous step's `load: true` writes fabro-agent-base:test into
+        # the local Docker daemon, but buildx's docker-container driver runs
+        # in a separate container with its own image store and CANNOT see
+        # daemon-loaded images. A second build-push-action step that does
+        # `FROM fabro-agent-base:test` therefore tries to resolve the tag
+        # against docker.io and fails with "pull access denied".
+        # `docker build` uses the daemon's BuildKit, which sees the loaded
+        # base image. We give up GHA cross-run cache for this layer (small:
+        # apt-get bats + COPY tests/) in exchange for correctness.
+        # All build args are hardcoded — no user-controlled input.
+        run: |
+          docker build \
+            -f tests/Dockerfile.test \
+            --build-arg BASE_IMAGE=fabro-agent-base:test \
+            -t fabro-agent-base:test-runner \
+            .
 
       - name: Run bats regression suite
         run: docker run --rm fabro-agent-base:test-runner
