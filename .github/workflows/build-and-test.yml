@@ -54,6 +54,7 @@ jobs:
         # apt-get bats + COPY tests/) in exchange for correctness.
         # All build args are hardcoded — no user-controlled input.
         run: |
+          set -euo pipefail
           docker build \
             -f tests/Dockerfile.test \
             --build-arg BASE_IMAGE=fabro-agent-base:test \
