@@ -1,0 +1,97 @@
+name: Build and test
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build base + test images and run bats suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build base image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          tags: fabro-agent-base:test
+          load: true  # load into local docker daemon, don't push
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: tests/Dockerfile.test
+          build-args: |
+            BASE_IMAGE=fabro-agent-base:test
+          tags: fabro-agent-base:test-runner
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run bats regression suite
+        run: docker run --rm fabro-agent-base:test-runner
+
+  version-bump-guard:
+    name: Require VERSION bump on image-surface changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require VERSION bump on changes to image surface
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          IMAGE_SURFACE_CHANGED=false
+          if echo "$CHANGED" | grep -qE '^(Dockerfile|docker/|tests/)'; then
+            IMAGE_SURFACE_CHANGED=true
+          fi
+          VERSION_CHANGED=false
+          if echo "$CHANGED" | grep -qE '^VERSION$'; then
+            VERSION_CHANGED=true
+          fi
+          if [ "$IMAGE_SURFACE_CHANGED" = "true" ] && [ "$VERSION_CHANGED" = "false" ]; then
+            echo "❌ Image surface (Dockerfile/docker/tests) changed without bumping VERSION"
+            echo "Bump fabro-agent-base/VERSION (semver) before merging:"
+            echo "  - patch: behaviour-preserving fix"
+            echo "  - minor: additive feature"
+            echo "  - major: contract break"
+            exit 1
+          fi
+          echo "✓ VERSION bump check passed"
+
+# TODO(PR-B): publish to ghcr.io on VERSION bump.
+# When VERSION changes on push to main, this workflow should additionally:
+#   1. Read the new VERSION from the file
+#   2. Build with multi-platform support (linux/amd64, linux/arm64)
+#   3. Login to ghcr.io with GITHUB_TOKEN
+#   4. Push tags: ghcr.io/nicholls-inc/fabro-agent-base:<VERSION> and :latest
+#   5. Add OCI labels (most are already in the Dockerfile)
+# See PR-B in the extraction plan for the full publish step.

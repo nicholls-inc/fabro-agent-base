@@ -1,0 +1,46 @@
+# Dockerfile for the fabro-agent-base bats regression suite.
+#
+# Build a derived image FROM the base image under test, layer in bats-core,
+# copy the test files, and run them. The default build arg points at the
+# locally built image tag used by the GHA workflow / `docker build .` smoke;
+# CI overrides BASE_IMAGE to test the immutable digest of the candidate.
+#
+# Usage:
+#   # From the repo root, after building the base image as fabro-agent-base:dev
+#   docker build -t fabro-agent-base:dev .
+#   docker build -f tests/Dockerfile.test -t fabro-agent-base:test .
+#   docker run --rm fabro-agent-base:test
+#
+# Or override BASE_IMAGE to test a published candidate:
+#   docker build -f tests/Dockerfile.test \
+#       --build-arg BASE_IMAGE=ghcr.io/nicholls-inc/fabro-agent-base:0.1.0-rc1 \
+#       -t fabro-agent-base:test .
+#
+# Note: BASE_IMAGE is intentionally NOT pinned to `latest` — that would mask
+# regressions in a candidate digest by silently pulling whatever `latest`
+# points at when the test runs.
+
+ARG BASE_IMAGE=fabro-agent-base:dev
+FROM ${BASE_IMAGE}
+
+# bats-core is packaged as `bats` on Debian. The base is python:3.13-slim
+# (Debian trixie), which carries bats 1.11.x — modern enough for the
+# `run`, `setup_file`, and `[[ ]]` patterns we use. If a future base bump
+# regresses to an older Debian where bats < 1.5, switch to the upstream
+# git-clone install:
+#   RUN git clone --depth 1 --branch v1.11.0 \
+#       https://github.com/bats-core/bats-core.git /tmp/bats-core \
+#    && /tmp/bats-core/install.sh /usr/local
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bats \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tests/ /tests/
+RUN chmod +x /tests/run-tests.sh
+
+WORKDIR /tests
+# Override the base image's ENTRYPOINT (entrypoint.sh pre-warms the GH
+# token cache, which fails without real secrets and is irrelevant for the
+# fail-closed regression tests).
+ENTRYPOINT []
+CMD ["./run-tests.sh"]

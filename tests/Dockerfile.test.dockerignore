@@ -1,0 +1,10 @@
+# Permissive override for the test image build. The base image's
+# .dockerignore is `**/*` deny-all + explicit allows for the auth surface;
+# the test image extends the base and additionally needs tests/ in the
+# build context. This file overrides .dockerignore for the test build only
+# (BuildKit resolves <dockerfile>.dockerignore in preference to .dockerignore).
+.git/
+.github/
+README.md
+VERSION
+*.md

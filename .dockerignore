@@ -1,0 +1,26 @@
+# Tight build context: only the Dockerfile and docker/ are needed at build
+# time. Everything else is excluded by default — explicit allows below.
+
+**/*
+
+# Allow only what the Dockerfile actually COPYs from.
+!Dockerfile
+!docker/
+!docker/**
+
+# Defense-in-depth: even if the catch-all above is loosened, these stay out.
+.git/
+.github/
+tests/
+README.md
+VERSION
+.dockerignore
+
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
