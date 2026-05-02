@@ -7,6 +7,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Bypass the 'tag already exists' guard (DANGEROUS — only for emergencies)"
+        type: boolean
+        default: false
 
 concurrency:
   group: build-and-test-${{ github.ref }}
@@ -64,10 +70,14 @@ jobs:
           fetch-depth: 0
 
       - name: Require VERSION bump on changes to image surface
+        # github.event.pull_request.*.sha is a 40-char hex string — but pass
+        # via env: to follow the GitHub Actions security pattern (avoids any
+        # ${{ ... }} interpolation directly inside `run:` scripts).
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
           IMAGE_SURFACE_CHANGED=false
           if echo "$CHANGED" | grep -qE '^(Dockerfile|docker/|tests/)'; then
@@ -87,11 +97,125 @@ jobs:
           fi
           echo "✓ VERSION bump check passed"
 
-# TODO(PR-B): publish to ghcr.io on VERSION bump.
-# When VERSION changes on push to main, this workflow should additionally:
-#   1. Read the new VERSION from the file
-#   2. Build with multi-platform support (linux/amd64, linux/arm64)
-#   3. Login to ghcr.io with GITHUB_TOKEN
-#   4. Push tags: ghcr.io/nicholls-inc/fabro-agent-base:<VERSION> and :latest
-#   5. Add OCI labels (most are already in the Dockerfile)
-# See PR-B in the extraction plan for the full publish step.
+  publish:
+    name: Publish to ghcr.io (multi-platform)
+    runs-on: ubuntu-latest
+    # Only fires on push-to-main and workflow_dispatch — never on PRs.
+    # PRs run build-and-test only, so the publish credentials are never
+    # exposed to PR-author-controlled code.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build-and-test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ ! -f VERSION ]]; then
+            echo "❌ VERSION file not found at repo root"
+            exit 1
+          fi
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ VERSION file content '$VERSION' does not match semver X.Y.Z"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved VERSION: $VERSION"
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite existing version tag
+        # Frozen-tag policy: once :X.Y.Z is published, the bytes behind it
+        # are immutable. A push that would overwrite the tag is rejected
+        # unless force_publish is explicitly set on workflow_dispatch
+        # (escape hatch for emergencies — e.g. yanked publish, registry corruption).
+        #
+        # The naive `if inspect ...; then exists; else missing; fi` shape
+        # is fail-open under transient registry errors (DNS hiccup, 5xx,
+        # rate-limit, mid-step token expiry): inspect exits non-zero, the
+        # guard reads "tag missing", the push proceeds, and a subsequent
+        # network recovery between inspect and push lets the push overwrite
+        # an immutable tag. We require a *positive* "not found" signal in
+        # the inspect output before treating the tag as publishable.
+        if: github.event.inputs.force_publish != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # VERSION already validated as ^[0-9]+\.[0-9]+\.[0-9]+$ in the
+          # Read VERSION step, so the inspect call's argument is safe to
+          # interpolate via env.
+          TAG="ghcr.io/nicholls-inc/fabro-agent-base:${VERSION}"
+          set +e
+          INSPECT_OUTPUT="$(docker buildx imagetools inspect "$TAG" 2>&1)"
+          INSPECT_EXIT=$?
+          set -e
+          if [[ $INSPECT_EXIT -eq 0 ]]; then
+            echo "❌ $TAG already exists on ghcr.io — refusing to overwrite."
+            echo "If the image surface has changed, bump VERSION (semver) and merge a new PR."
+            echo "If you genuinely need to overwrite (yanked publish, registry repair), re-run"
+            echo "this workflow via workflow_dispatch with force_publish=true."
+            exit 1
+          fi
+          # Treat "not found" as the only acceptable non-zero exit. Any
+          # other failure (network, auth, registry 5xx) means we cannot
+          # prove the tag is unpublished — refuse rather than fail-open.
+          if ! echo "$INSPECT_OUTPUT" | grep -qiE 'not found|manifest unknown|no such manifest'; then
+            echo "❌ Unable to determine whether $TAG exists on ghcr.io — guard cannot prove safety."
+            echo "Inspect exit code: $INSPECT_EXIT"
+            echo "Inspect output:"
+            echo "$INSPECT_OUTPUT"
+            echo ""
+            echo "This is usually a transient registry error. Re-run the workflow."
+            echo "If the error persists and you've confirmed the tag is unpublished by"
+            echo "other means, dispatch with force_publish=true."
+            exit 1
+          fi
+          echo "✓ $TAG is unpublished — proceeding"
+
+      - name: Build and push (multi-platform)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/nicholls-inc/fabro-agent-base:${{ steps.version.outputs.version }}
+            ghcr.io/nicholls-inc/fabro-agent-base:latest
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Provenance + SBOM disabled for v0.x to avoid the unsigned-attestation
+          # noise during bootstrap. Re-enable before v1.0 / public second consumer.
+          provenance: false
+          sbom: false
+
+      - name: Publish summary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "- \`ghcr.io/nicholls-inc/fabro-agent-base:${VERSION}\`"
+            echo "- \`ghcr.io/nicholls-inc/fabro-agent-base:latest\` (moving alias)"
+            echo ""
+            echo "Consumers should pin to the version tag, never \`:latest\`."
+          } >> "$GITHUB_STEP_SUMMARY"
